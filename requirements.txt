@@ -1,0 +1,5 @@
+earthengine-api
+Flask
+# Ces deux sont pour la fonction Cloud et sont souvent implicites, mais les lister est plus sûr
+google-cloud-functions
+requests
