@@ -1,0 +1,23 @@
+# Secrets — ne JAMAIS commiter ces fichiers
+.env
+*.env
+.env.*
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+venv/
+.venv/
+env/
+
+# Données locales (geojson lourds — à mettre sur Render Disk)
+*.geojson
+!vigilance_active.geojson
+
+# Logs et temporaires
+*.log
+*.tmp
+.DS_Store
+Thumbs.db
