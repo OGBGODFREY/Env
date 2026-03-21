@@ -6,3 +6,4 @@ requests
 sendgrid
 werkzeug
 python-dotenv
+gunicorn
