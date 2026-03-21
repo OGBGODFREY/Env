@@ -1,4 +1,8 @@
-Flask
+flask
+flask-cors
 psycopg2-binary
-Flask-Cors
-gunicorn
+apscheduler
+requests
+sendgrid
+werkzeug
+python-dotenv
