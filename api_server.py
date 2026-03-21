@@ -10,15 +10,7 @@ app = Flask(__name__)
 CORS(app)
 
 
-# =======================================================
-# Configuration de la Base de Données (Pooler 6543)
-# =======================================================
-# REMPLACER CES VALEURS PAR VOS PROPRES CREDENTIALS SUPABASE
-DB_HOST = "aws-1-eu-west-3.pooler.supabase.com"
-DB_NAME = "postgres"
-DB_USER = "postgres.czyoeuufsrsmzixxffkg"
-DB_PASSWORD = "Godfreyogb02@1"
-DB_PORT = "6543"
+
 
 
 # Constantes pour les noms de tables de risque
