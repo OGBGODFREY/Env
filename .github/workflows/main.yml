@@ -7,16 +7,25 @@ on:
   # Permet aussi de lancer manuellement depuis l'onglet Actions de GitHub
   workflow_dispatch:
 
+# Permissions nécessaires pour que le workflow puisse committer et pousser
+permissions:
+  contents: write
+
+env:
+  # Force Node.js 24 pour éviter le warning de dépréciation Node.js 20
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 jobs:
   update-vigilance:
     runs-on: ubuntu-latest
 
     steps:
-      # 1. Récupérer le code du repo
+      # 1. Récupérer le code du repo avec le token qui autorise le push
       - name: Checkout repo
         uses: actions/checkout@v4
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+          persist-credentials: true
 
       # 2. Installer Python et la dépendance requests
       - name: Setup Python
@@ -44,5 +53,5 @@ jobs:
             echo "Aucun changement dans vigilance_active.geojson — pas de commit."
           else
             git commit -m "chore: update vigilance_active.geojson [$(date -u '+%Y-%m-%d %H:%M UTC')]"
-            git push
+            git push origin HEAD:main
           fi
