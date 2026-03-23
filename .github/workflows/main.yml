@@ -2,8 +2,14 @@ name: Update Meteo Vigilance
 
 on:
   schedule:
-    # Toutes les 5 heures (UTC) : 00h, 05h, 10h, 15h, 20h
-    - cron: '0 0,5,10,15,20 * * *'
+    # Heures calculées pour l'HIVER (Paris = UTC+1)
+    # 05:10 UTC -> 06:10 Paris
+    # 09:10 UTC -> 10:10 Paris
+    # 13:10 UTC -> 14:10 Paris
+    # 15:10 UTC -> 16:10 Paris
+    # 19:10 UTC -> 20:10 Paris
+    # 23:10 UTC -> 00:10 Paris
+    - cron: '10 5,9,13,15,19,23 * * *'
   # Permet aussi de lancer manuellement depuis l'onglet Actions de GitHub
   workflow_dispatch:
 
