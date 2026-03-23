@@ -1,6 +1,5 @@
 from flask import Flask, jsonify, request, send_from_directory
 from flask_cors import CORS
-from apscheduler.schedulers.background import BackgroundScheduler
 import json, os, math, requests, datetime, re, secrets, random
 import psycopg2
 from psycopg2.extras import RealDictCursor
@@ -58,8 +57,10 @@ DB_CONFIG = {
 }
 
 API_IGN_URL    = "https://apicarto.ign.fr/api/rpg/v2"
-MF_API_KEY     = os.environ["MF_API_KEY"]
-MF_VIGI_URL    = "https://public-api.meteofrance.fr/public/DPVigilance/v1/cartevigilance/encours"
+# MF_API_KEY n'est plus utilisé directement par app.py
+# (l'appel API MF est fait par update_vigilance.py via GitHub Actions)
+# On le garde en optional pour ne pas casser un éventuel appel futur.
+MF_API_KEY     = os.environ.get("MF_API_KEY", "")
 OPEN_METEO_URL = "https://api.open-meteo.com/v1/forecast"
 
 # ── Chemins des fichiers de données ──────────────────────────────────────────
@@ -154,6 +155,8 @@ def ensure_tables():
         );""",
         "ALTER TABLE users_profiles ADD COLUMN IF NOT EXISTS plan TEXT NOT NULL DEFAULT 'free';",
         "ALTER TABLE users_profiles ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW();",
+        # Préférences utilisateur : langue, unité de mesure
+        "ALTER TABLE users_profiles ADD COLUMN IF NOT EXISTS preferences JSONB DEFAULT '{\"lang\":\"fr\",\"unit\":\"metric\"}';",
     ]
     conn = None
     try:
@@ -594,271 +597,43 @@ def dist_to_geometry(lat, lon, geom):
     return min(haversine(lat, lon, p[1], p[0]) for p in pts)
 
 # ============================================================
-# VIGILANCE (Météo-France) — mise à jour automatique toutes les heures
+# VIGILANCE — cache mémoire (fichier mis à jour par GitHub Actions)
 # ============================================================
 
-# Noms et icônes des phénomènes Météo-France
-PHENOM_NAMES = {
-    1: "Vent violent", 2: "Pluie-inondation", 3: "Orages",
-    4: "Crues", 5: "Neige-verglas", 6: "Canicule",
-    7: "Grand froid", 8: "Avalanches", 9: "Vagues-submersion"
-}
-PHENOM_ICONS = {
-    1: "💨", 2: "🌧️", 3: "⛈️", 4: "🌊", 5: "❄️",
-    6: "🌡️", 7: "🥶", 8: "🏔️", 9: "🌊"
-}
+# Constantes utilisées par /api/vigilance pour servir le cache
 VIGI_COLORS = {1: "vert", 2: "jaune", 3: "orange", 4: "rouge"}
 VIGI_HEX    = {1: "#1e8449", 2: "#d97706", 3: "#c2410c", 4: "#b91c1c"}
 
 
-def _dept_from_domain_id(domain_id):
-    """
-    Valide et normalise un domain_id Météo-France.
-    Dans la réponse réelle, domain_id EST déjà le code département ("02", "17", "60"…).
-    On ignore les codes non-départementaux : "FRA", codes à 4 chiffres (zones marines ex: "3010"),
-    "99" (outre-mer global), etc.
-    """
-    if domain_id is None:
-        return None
-    s = str(domain_id).strip()
-
-    # Ignorer les codes non-départementaux
-    if s in ("FRA", "99", ""):
-        return None
-    # Codes à 4+ chiffres = zones côtières/marines (ex: "3010", "6410") → ignorer
-    if len(s) >= 4 and s.isdigit():
-        return None
-
-    # Corse
-    if s in ("2A", "2B"):
-        return s
-
-    # Code purement numérique sur 1 ou 2 chiffres
-    if s.isdigit():
-        n = int(s)
-        if 1 <= n <= 95:
-            return s.zfill(2)
-        return None  # DOM-TOM ou code invalide
-
-    return None
-
-
-def _parse_mf_alerts(raw):
-    """
-    Parse la réponse JSON de l'API DPVigilance v1 (cartevigilance/encours).
-
-    Structure réelle confirmée :
-      raw["product"]["periods"] = [
-        {
-          "echeance": "J",
-          "timelaps": {
-            "domain_ids": [
-              {
-                "domain_id": "02",          ← code département directement
-                "max_color_id": 2,           ← max sur la période (1=vert,2=jaune,3=orange,4=rouge)
-                "phenomenon_items": [
-                  {
-                    "phenomenon_id": "4",
-                    "phenomenon_max_color_id": 2,
-                    "timelaps_items": [...]
-                  }
-                ]
-              },
-              ...
-            ]
-          }
-        },
-        { "echeance": "J1", ... }  ← deuxième période éventuelle
-      ]
-
-    On prend le max_color_id le plus élevé toutes périodes confondues pour chaque
-    couple (département, phénomène).
-    """
-    alerts_map = {}  # (dept, phenomenon_id) → meilleure alerte
-
-    if not raw:
-        return []
-
-    product = raw.get("product", {})
-    periods = product.get("periods", [])
-
-    for period in periods:
-        echeance   = period.get("echeance", "")
-        begin_time = period.get("begin_validity_time", "")
-        end_time   = period.get("end_validity_time",   "")
-        timelaps   = period.get("timelaps", {})
-        domain_ids = timelaps.get("domain_ids", [])
-
-        for d in domain_ids:
-            raw_did = d.get("domain_id")
-            dept    = _dept_from_domain_id(raw_did)
-            if not dept:
-                continue  # FRA, zones marines, DOM-TOM → ignorés
-
-            max_color = int(d.get("max_color_id", 1) or 1)
-            if max_color < 2:
-                continue  # vert = pas de vigilance
-
-            # Parcourir chaque phénomène de ce département sur cette période
-            for ph in d.get("phenomenon_items", []):
-                ph_id    = ph.get("phenomenon_id")
-                ph_color = int(ph.get("phenomenon_max_color_id", 1) or 1)
-
-                if ph_color < 2:
-                    continue  # ce phénomène est vert sur ce département
-
-                try:
-                    ph_id_int = int(ph_id)
-                except (ValueError, TypeError):
-                    continue
-
-                key = (dept, ph_id_int)
-                if key not in alerts_map or ph_color > alerts_map[key]["level"]:
-                    alerts_map[key] = {
-                        "dept":       dept,
-                        "domain_id":  str(raw_did),
-                        "level":      ph_color,
-                        "phenomenon": ph_id_int,
-                        "colorName":  VIGI_COLORS.get(ph_color, "jaune"),
-                        "colorHex":   VIGI_HEX.get(ph_color,    "#d97706"),
-                        "phenomName": PHENOM_NAMES.get(ph_id_int, "Vigilance"),
-                        "phenomIcon": PHENOM_ICONS.get(ph_id_int, "⚠️"),
-                        "dateDebut":  begin_time,
-                        "dateFin":    end_time,
-                        "echeance":   echeance,
-                    }
-
-    result = sorted(alerts_map.values(), key=lambda x: (x["dept"], -x["level"]))
-
-    print(f"[Vigilance] {len(result)} alertes parsées "
-          f"({len([a for a in result if a['level']==4])} rouge, "
-          f"{len([a for a in result if a['level']==3])} orange, "
-          f"{len([a for a in result if a['level']==2])} jaune) "
-          f"— depts: {sorted(set(a['dept'] for a in result))}")
-    return result
-
-
 def update_vigilance():
     """
-    Récupère la carte de vigilance Météo-France via l'API DPVigilance/v1,
-    parse les domain_id (2 premiers chiffres = département, max_color_id = niveau),
-    et enrichit vigilance_active.geojson (points lat/lon par département)
-    en y injectant les alertes du département.
-    Appelé automatiquement toutes les heures par le scheduler APScheduler.
+    Charge vigilance_active.geojson en cache mémoire.
+    Le fichier est mis à jour toutes les 5h par GitHub Actions (update_vigilance.py).
+    Cette fonction est appelée une seule fois au démarrage de l'app.
     """
     global _vigilance_cache
-    updated_at = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None).isoformat()
-
-    # ── 1. Charger le fichier de base (points départements) ──
-    # vigilance_active.geojson contient 1 Point par département avec code + departement
-    base_features = []
-    if os.path.exists(VIGILANCE_OUTPUT):
-        try:
-            with open(VIGILANCE_OUTPUT, 'r', encoding='utf-8') as f:
-                base_gj = json.load(f)
-            for feat in base_gj.get("features", []):
-                props = feat.get("properties", {})
-                code = props.get("code", "")
-                dept_name = props.get("departement", "")
-                if not code and not dept_name:
-                    continue
-                # Extraire uniquement les propriétés de base (sans les données de vigilance injectées)
-                base_features.append({
-                    "type": "Feature",
-                    "properties": {
-                        "code":        str(code).strip(),
-                        "departement": dept_name,
-                    },
-                    "geometry": feat.get("geometry"),
-                })
-        except Exception as e:
-            print(f"[Vigilance] Erreur lecture fichier base: {e}")
-
-    if not base_features:
-        print("[Vigilance] Aucun département dans vigilance_active.geojson — abandon")
+    if not os.path.exists(VIGILANCE_OUTPUT):
+        print("[Vigilance] Fichier introuvable — cache non chargé")
         return
-
-    # ── 2. Appel API Météo-France ──
-    alerts = []
-    api_ok = False
     try:
-        headers = {"apikey": MF_API_KEY, "Accept": "application/json"}
-        resp = requests.get(MF_VIGI_URL, headers=headers, timeout=15)
-        if resp.status_code == 200:
-            raw = resp.json()
-            alerts = _parse_mf_alerts(raw)
-            api_ok = True
-        else:
-            print(f"[Vigilance] API HTTP {resp.status_code} — données précédentes conservées dans le fichier")
+        with open(VIGILANCE_OUTPUT, "r", encoding="utf-8") as f:
+            gj = json.load(f)
+        alerts = [
+            a for feat in gj.get("features", [])
+            for a in feat.get("properties", {}).get("vigi_alerts", [])
+        ]
+        _vigilance_cache = {
+            "alerts":     alerts,
+            "geojson":    gj,
+            "updated_at": gj.get("updated_at"),
+        }
+        n_alert = sum(1 for feat in gj.get("features", [])
+                      if feat.get("properties", {}).get("vigi_level", 1) >= 2)
+        print(f"[Vigilance] Cache chargé — {len(alerts)} alertes, "
+              f"{n_alert} depts en vigilance, "
+              f"updated_at={gj.get('updated_at', '?')}")
     except Exception as e:
-        print(f"[Vigilance] Erreur appel API: {e}")
-
-    # Si l'API échoue, on recharge les alertes depuis le fichier existant pour conserver le cache mémoire
-    if not api_ok and _vigilance_cache:
-        print("[Vigilance] Conservation du cache mémoire existant")
-        return
-
-    # ── 3. Indexer les alertes par département ──
-    # {dept_code: [alert, ...]}  — un dept peut avoir plusieurs phénomènes
-    alerts_by_dept: dict = {}
-    for a in alerts:
-        dept = a["dept"]
-        alerts_by_dept.setdefault(dept, []).append(a)
-
-    # Niveau max par département
-    max_level_by_dept: dict = {
-        dept: max(a["level"] for a in lst)
-        for dept, lst in alerts_by_dept.items()
-    }
-
-    # ── 4. Enrichir chaque feature de base avec les alertes du département ──
-    enriched_features = []
-    for feat in base_features:
-        props = feat["properties"].copy()
-        code  = props["code"].strip()
-        # Normaliser le code : "1" → "01", "17" reste "17", "2A"/"2B" inchangés
-        if code.isdigit():
-            code = code.zfill(2)
-        dept_alerts = alerts_by_dept.get(code, [])
-        max_lvl     = max_level_by_dept.get(code, 1)  # 1 = vert (pas de vigilance)
-
-        props["dept_num"]       = code
-        props["vigi_level"]     = max_lvl
-        props["vigi_colorName"] = VIGI_COLORS.get(max_lvl, "vert")
-        props["vigi_colorHex"]  = VIGI_HEX.get(max_lvl,    "#1e8449")
-        props["vigi_alerts"]    = dept_alerts   # liste des alertes par phénomène pour ce dept
-        props["updated_at"]     = updated_at
-
-        enriched_features.append({
-            "type":       "Feature",
-            "properties": props,
-            "geometry":   feat["geometry"],
-        })
-
-    enriched_geojson = {
-        "type":       "FeatureCollection",
-        "features":   enriched_features,
-        "updated_at": updated_at,
-    }
-
-    # ── 5. Mettre à jour le cache mémoire ──
-    _vigilance_cache = {
-        "alerts":     alerts,
-        "geojson":    enriched_geojson,
-        "updated_at": updated_at,
-    }
-
-    # ── 6. Écrire le fichier vigilance_active.geojson enrichi ──
-    try:
-        out_dir = os.path.dirname(os.path.abspath(VIGILANCE_OUTPUT))
-        os.makedirs(out_dir, exist_ok=True)
-        with open(VIGILANCE_OUTPUT, 'w', encoding='utf-8') as f:
-            json.dump(enriched_geojson, f, ensure_ascii=False)
-        n_alert = len([f for f in enriched_features if f["properties"].get("vigi_level", 1) >= 2])
-        print(f"[Vigilance] ✅ Fichier mis à jour — {len(enriched_features)} départements "
-              f"dont {n_alert} en vigilance · {updated_at}")
-    except Exception as e:
-        print(f"[Vigilance] Erreur écriture fichier: {e}")
+        print(f"[Vigilance] Erreur chargement cache: {e}")
 
 # ============================================================
 # TRI ANALYSIS
@@ -1554,6 +1329,70 @@ def logout():
     auth=request.headers.get('Authorization',''); token=auth.replace('Bearer ','').strip()
     _sessions.pop(token,None); return jsonify({"status":"ok"})
 
+@app.route('/api/auth/change-email', methods=['PATCH'])
+@require_auth
+def change_email():
+    """Change l'email de l'utilisateur après vérification du mot de passe."""
+    user     = request.current_user
+    data     = request.json or {}
+    new_email = (data.get('email') or '').strip().lower()
+    password  = data.get('password', '')
+    if not new_email or not password:
+        return jsonify({"error": "Nouvel email et mot de passe requis."}), 400
+    if not re.match(r'^[^@]+@[^@]+\.[^@]+$', new_email):
+        return jsonify({"error": "Format d'email invalide."}), 400
+    conn = None
+    try:
+        conn = get_db(); cur = conn.cursor(cursor_factory=RealDictCursor)
+        cur.execute("SELECT password_hash FROM users_profiles WHERE id = %s", (user['id'],))
+        row = cur.fetchone()
+        if not row or not check_password_hash(row['password_hash'], password):
+            return jsonify({"error": "Mot de passe incorrect."}), 401
+        cur.execute("SELECT id FROM users_profiles WHERE email = %s AND id != %s",
+                    (new_email, user['id']))
+        if cur.fetchone():
+            return jsonify({"error": "Cet email est déjà utilisé."}), 409
+        cur.execute("UPDATE users_profiles SET email = %s WHERE id = %s",
+                    (new_email, user['id']))
+        conn.commit()
+        print(f"[Auth] Email modifié pour user {user['id']} → {new_email}")
+        return jsonify({"status": "ok", "email": new_email}), 200
+    except Exception as e:
+        if conn: conn.rollback()
+        return jsonify({"error": "Erreur serveur."}), 500
+    finally:
+        if conn: conn.close()
+
+@app.route('/api/auth/change-password', methods=['PATCH'])
+@require_auth
+def change_password():
+    """Change le mot de passe après vérification de l'ancien."""
+    user    = request.current_user
+    data    = request.json or {}
+    old_pw  = data.get('old_password', '')
+    new_pw  = data.get('new_password', '')
+    if not old_pw or not new_pw:
+        return jsonify({"error": "Ancien et nouveau mot de passe requis."}), 400
+    ok, msg = validate_password(new_pw)
+    if not ok: return jsonify({"error": msg}), 400
+    conn = None
+    try:
+        conn = get_db(); cur = conn.cursor(cursor_factory=RealDictCursor)
+        cur.execute("SELECT password_hash FROM users_profiles WHERE id = %s", (user['id'],))
+        row = cur.fetchone()
+        if not row or not check_password_hash(row['password_hash'], old_pw):
+            return jsonify({"error": "Mot de passe actuel incorrect."}), 401
+        cur.execute("UPDATE users_profiles SET password_hash = %s WHERE id = %s",
+                    (generate_password_hash(new_pw), user['id']))
+        conn.commit()
+        print(f"[Auth] Mot de passe modifié pour user {user['id']}")
+        return jsonify({"status": "ok"}), 200
+    except Exception as e:
+        if conn: conn.rollback()
+        return jsonify({"error": "Erreur serveur."}), 500
+    finally:
+        if conn: conn.close()
+
 @app.route('/api/auth/delete-account', methods=['DELETE'])
 @require_auth
 def delete_account():
@@ -1604,12 +1443,119 @@ def me():
     user=request.current_user; conn=None
     try:
         conn=get_db(); cur=conn.cursor(cursor_factory=RealDictCursor)
-        cur.execute("SELECT selected_zones FROM users_profiles WHERE id = %s",(user['id'],))
-        row=cur.fetchone(); zones=row['selected_zones'] if row else []
+        cur.execute("SELECT selected_zones, preferences FROM users_profiles WHERE id = %s",(user['id'],))
+        row=cur.fetchone()
+        zones=row['selected_zones'] if row else []
         if isinstance(zones,str): zones=json.loads(zones)
+        prefs=row['preferences'] if row else {}
+        if isinstance(prefs,str): prefs=json.loads(prefs)
+        if not prefs: prefs={"lang":"fr","unit":"metric"}
         plan=get_plan(user['id'])
-        return jsonify({"user":{**dict(user),"plan":plan,"selected_zones":zones,"zones_count":len(zones)}})
+        return jsonify({"user":{**dict(user),"plan":plan,"selected_zones":zones,"zones_count":len(zones),"preferences":prefs}})
     except Exception as e: return jsonify({"error":str(e)}),500
+    finally:
+        if conn: conn.close()
+
+@app.route('/api/user/preferences', methods=['PATCH'])
+@require_auth
+def update_preferences():
+    """Met à jour les préférences utilisateur (langue, unité de mesure)."""
+    user = request.current_user
+    data = request.json or {}
+    lang = data.get('lang')
+    unit = data.get('unit')
+    # Valeurs autorisées
+    if lang and lang not in ('fr', 'en', 'es', 'de', 'pt', 'ar'):
+        return jsonify({"error": "Langue non supportée."}), 400
+    if unit and unit not in ('metric', 'imperial'):
+        return jsonify({"error": "Unité non supportée."}), 400
+    conn = None
+    try:
+        conn = get_db(); cur = conn.cursor(cursor_factory=RealDictCursor)
+        cur.execute("SELECT preferences FROM users_profiles WHERE id = %s", (user['id'],))
+        row = cur.fetchone()
+        prefs = row['preferences'] if row else {}
+        if isinstance(prefs, str): prefs = json.loads(prefs)
+        if not prefs: prefs = {"lang": "fr", "unit": "metric"}
+        if lang: prefs['lang'] = lang
+        if unit: prefs['unit'] = unit
+        cur.execute("UPDATE users_profiles SET preferences = %s WHERE id = %s",
+                    (json.dumps(prefs), user['id']))
+        conn.commit()
+        return jsonify({"status": "ok", "preferences": prefs})
+    except Exception as e:
+        if conn: conn.rollback()
+        return jsonify({"error": str(e)}), 500
+    finally:
+        if conn: conn.close()
+
+@app.route('/api/user/export', methods=['GET'])
+@require_auth
+def export_user_data():
+    """
+    Exporte toutes les données de l'utilisateur en JSON (RGPD).
+    Contient : email, plan, préférences, parcelles enregistrées.
+    """
+    user = request.current_user
+    conn = None
+    try:
+        conn = get_db(); cur = conn.cursor(cursor_factory=RealDictCursor)
+        cur.execute(
+            "SELECT email, plan, preferences, selected_zones, created_at "
+            "FROM users_profiles WHERE id = %s",
+            (user['id'],)
+        )
+        row = cur.fetchone()
+        if not row:
+            return jsonify({"error": "Utilisateur introuvable."}), 404
+
+        zones = row['selected_zones'] or []
+        if isinstance(zones, str): zones = json.loads(zones)
+        prefs = row['preferences'] or {}
+        if isinstance(prefs, str): prefs = json.loads(prefs)
+
+        export = {
+            "parisk_export": {
+                "version": "1.0",
+                "exported_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                "user": {
+                    "id":         user['id'],
+                    "email":      row['email'],
+                    "plan":       row['plan'],
+                    "created_at": row['created_at'].isoformat() if row['created_at'] else None,
+                    "preferences": prefs,
+                },
+                "parcelles": [
+                    {
+                        "id":       p.get('id'),
+                        "label":    p.get('label'),
+                        "surface":  p.get('surface'),
+                        "cultures": p.get('cultures', []),
+                        "geometry": p.get('geometry'),
+                        "savedAt":  p.get('savedAt'),
+                    }
+                    for p in zones if isinstance(p, dict)
+                ],
+                "stats": {
+                    "total_parcelles": len(zones),
+                    "surface_totale_ha": round(
+                        sum(float(p.get('surface') or 0) for p in zones if isinstance(p, dict)), 2
+                    ),
+                }
+            }
+        }
+
+        from flask import Response
+        resp = Response(
+            json.dumps(export, ensure_ascii=False, indent=2),
+            mimetype='application/json',
+            headers={
+                'Content-Disposition': f'attachment; filename="parisk_export_{user["id"]}.json"'
+            }
+        )
+        return resp
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
     finally:
         if conn: conn.close()
 
@@ -1718,45 +1664,31 @@ def update_parcel(parcel_id):
         if conn: conn.close()
 
 # ============================================================
-# STARTUP
+# STARTUP — fonctionne avec python app.py ET gunicorn app:app
 # ============================================================
-if __name__ == '__main__':
+def _startup():
+    """
+    Initialise l'application au démarrage.
+    - Vérifie/crée les tables DB
+    - Charge TRI et MVT en mémoire
+    - Charge vigilance_active.geojson en cache mémoire
+      (le fichier est mis à jour toutes les 5h par GitHub Actions)
+
+    Guard WERKZEUG_RUN_MAIN : évite la double exécution avec le reloader Werkzeug.
+    """
+    # En mode debug Werkzeug, ne s'exécuter que dans le processus worker
+    run_main = os.environ.get('WERKZEUG_RUN_MAIN')
+    if run_main is not None and run_main != 'true':
+        return  # processus reloader → skip
+
     ensure_tables()
     load_tri()
     load_mvt()
+    update_vigilance()  # charge le fichier GH Actions en cache mémoire
 
-    # APScheduler ne doit démarrer que dans le processus principal de Flask.
-    # Avec debug=True, Werkzeug lance 2 processus (reloader + worker).
-    # On utilise la variable WERKZEUG_RUN_MAIN pour ne lancer le scheduler
-    # que dans le processus worker, évitant les doubles déclenchements.
-    import os as _os
-    _is_main_process = not _os.environ.get('WERKZEUG_RUN_MAIN') or _os.environ.get('WERKZEUG_RUN_MAIN') == 'true'
-    if _is_main_process:
-        # Charger les données de vigilance depuis le fichier existant au démarrage
-        # (sans appeler l'API MF pour ne pas bloquer le démarrage)
-        if os.path.exists(VIGILANCE_OUTPUT):
-            try:
-                with open(VIGILANCE_OUTPUT, 'r', encoding='utf-8') as _f:
-                    _gj = json.load(_f)
-                _vigilance_cache = {
-                    "alerts": [
-                        a for feat in _gj.get("features", [])
-                        for a in feat.get("properties", {}).get("vigi_alerts", [])
-                    ],
-                    "geojson": _gj,
-                    "updated_at": _gj.get("updated_at")
-                }
-                print(f"[Vigilance] Cache initialisé depuis fichier existant · {len(_vigilance_cache['alerts'])} alertes")
-            except Exception as _e:
-                print(f"[Vigilance] Impossible de lire le fichier existant: {_e}")
 
-        scheduler = BackgroundScheduler(daemon=True)
-        # Déclenchement 1 minute après le démarrage (pas immédiat) puis toutes les heures
-        _first_run = datetime.datetime.now() + datetime.timedelta(minutes=1)
-        scheduler.add_job(update_vigilance, 'interval', hours=1,
-                          id='vigilance_update', next_run_time=_first_run,
-                          misfire_grace_time=300, coalesce=True)
-        scheduler.start()
-        print(f"[Scheduler] Vigilance planifiée : premier appel à {_first_run.strftime('%H:%M:%S')}, puis toutes les heures")
+# Exécution à l'import du module → compatible Gunicorn ET python app.py
+_startup()
 
+if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000, debug=True, use_reloader=True)
