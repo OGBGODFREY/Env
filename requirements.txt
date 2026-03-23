@@ -1,7 +1,6 @@
 flask
 flask-cors
 psycopg2-binary
-apscheduler
 requests
 sendgrid
 werkzeug
