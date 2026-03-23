@@ -1,0 +1,48 @@
+name: Update Meteo Vigilance
+
+on:
+  schedule:
+    # Toutes les 5 heures (UTC) : 00h, 05h, 10h, 15h, 20h
+    - cron: '0 0,5,10,15,20 * * *'
+  # Permet aussi de lancer manuellement depuis l'onglet Actions de GitHub
+  workflow_dispatch:
+
+jobs:
+  update-vigilance:
+    runs-on: ubuntu-latest
+
+    steps:
+      # 1. Récupérer le code du repo
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      # 2. Installer Python et la dépendance requests
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install requests
+
+      # 3. Lancer le script de mise à jour
+      - name: Run update_vigilance.py
+        env:
+          MF_API_KEY: ${{ secrets.MF_API_KEY }}
+        run: python update_vigilance.py
+
+      # 4. Committer et pousser le fichier mis à jour si des changements existent
+      - name: Commit and push if changed
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add vigilance_active.geojson
+          # Ne committer que s'il y a des changements
+          if git diff --staged --quiet; then
+            echo "Aucun changement dans vigilance_active.geojson — pas de commit."
+          else
+            git commit -m "chore: update vigilance_active.geojson [$(date -u '+%Y-%m-%d %H:%M UTC')]"
+            git push
+          fi
