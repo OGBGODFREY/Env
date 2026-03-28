@@ -1,5 +1,6 @@
 from flask import Flask, jsonify, request, send_from_directory
 from flask_cors import CORS
+from apscheduler.schedulers.background import BackgroundScheduler
 import json, os, math, requests, datetime, re, secrets, random
 import psycopg2
 from psycopg2.extras import RealDictCursor
@@ -57,20 +58,18 @@ DB_CONFIG = {
 }
 
 API_IGN_URL    = "https://apicarto.ign.fr/api/rpg/v2"
-# MF_API_KEY n'est plus utilisé directement par app.py
-# (l'appel API MF est fait par update_vigilance.py via GitHub Actions)
-# On le garde en optional pour ne pas casser un éventuel appel futur.
-MF_API_KEY     = os.environ.get("MF_API_KEY", "")
+MF_API_KEY     = os.environ["MF_API_KEY"]
+MF_VIGI_URL    = "https://public-api.meteofrance.fr/public/DPVigilance/v1/cartevigilance/encours"
 OPEN_METEO_URL = "https://api.open-meteo.com/v1/forecast"
 
 # ── Chemins des fichiers de données ──────────────────────────────────────────
-# En local  : dossier EnvIntel_Agri ou Parisk selon l'installation.
+# En local  : dossier EnvIntel_Agri ou RiskAgri selon l'installation.
 # Sur Render : variable d'environnement DATA_DIR ou dossier persistant /data.
 def _find_base_dir():
     if os.environ.get('DATA_DIR') and os.path.isdir(os.environ['DATA_DIR']):
         return os.environ['DATA_DIR']
     candidates = [
-        r"C:\Users\godfr\Documents\Parisk",
+        r"C:\Users\godfr\Documents\RiskAgri",
         r"C:\Users\godfr\Documents\EnvIntel_Agri",
         "/data",
         os.path.join(os.path.dirname(os.path.abspath(__file__)), "data"),
@@ -85,20 +84,21 @@ BASE_DIR           = _find_base_dir()
 TRI_GEOJSON_PATH   = os.path.join(BASE_DIR, "n_tri_s.geojson")
 MVT_GEOJSON_PATH   = os.path.join(BASE_DIR, "mvt_national.geojson")
 DEPTS_GEOJSON_PATH = os.path.join(BASE_DIR, "departements.geojson")
+INCENDIE_GEOJSON_PATH = os.path.join(BASE_DIR, "incendies_fr_2004_2024.geojson")
 VIGILANCE_OUTPUT   = os.path.join(BASE_DIR, "vigilance_active.geojson")
 print(f"[Config] BASE_DIR = {BASE_DIR}")
 
-FREE_PLAN_LIMIT = 100
+FREE_PLAN_LIMIT = 10  # max parcelles par défaut (surchargeable par max_parcel dans Supabase)
 
 # ── SendGrid ──────────────────────────────────────────────────────────────────
 # Variables d'environnement (configurées dans Render Dashboard → Environment) :
 #   SENDGRID_API_KEY  → clé API SendGrid (Settings → API Keys)
 #   EMAIL_FROM_ADDR   → adresse vérifiée dans SendGrid (Single Sender Verification)
-#   EMAIL_FROM_NAME   → nom affiché dans la boîte du destinataire (ex: "Parisk")
+#   EMAIL_FROM_NAME   → nom affiché dans la boîte du destinataire (ex: "RiskAgri")
 #                       Peut être n'importe quel nom d'application, pas forcément l'email.
 # En local : les valeurs ci-dessous sont utilisées si les variables d'env ne sont pas définies.
 SENDGRID_API_KEY = os.environ.get('SENDGRID_API_KEY', 'SG.xxxxxxxxxxxxxxxxxx')
-EMAIL_FROM_NAME  = os.environ.get('EMAIL_FROM_NAME',  'Parisk')
+EMAIL_FROM_NAME  = os.environ.get('EMAIL_FROM_NAME',  'RiskAgri')
 EMAIL_FROM_ADDR  = os.environ.get('EMAIL_FROM_ADDR',  'votre.email@gmail.com')
 
 # URL de base → utilisée pour le lien de reset password dans l'email
@@ -111,6 +111,7 @@ _reset_tokens:    dict = {}  # { token: {user_id, email, expires_at} }
 _tri_cache        = None
 _mvt_cache        = None
 _vigilance_cache  = None
+_incendie_cache   = None
 _sessions:        dict = {}
 
 # ============================================================
@@ -157,6 +158,8 @@ def ensure_tables():
         "ALTER TABLE users_profiles ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW();",
         # Préférences utilisateur : langue, unité de mesure
         "ALTER TABLE users_profiles ADD COLUMN IF NOT EXISTS preferences JSONB DEFAULT '{\"lang\":\"fr\",\"unit\":\"metric\"}';",
+        # Limite de parcelles personnalisable par compte (NULL = utilise FREE_PLAN_LIMIT = 10)
+        "ALTER TABLE users_profiles ADD COLUMN IF NOT EXISTS max_parcel INTEGER DEFAULT NULL;",
     ]
     conn = None
     try:
@@ -174,7 +177,7 @@ def ensure_tables():
 
 def validate_password(pw: str):
     if len(pw) < 8:
-        return False, "Le mot de passe doit contenir au moins 8 caractères."
+        return False, "Le mot de passe doit contenir au moins 10 caractères."
     if not re.search(r'[!@#$%^&*()_+\-=\[\]{};\':"\\|,.<>/?`~]', pw):
         return False, "Au moins un caractère spécial requis."
     return True, "OK"
@@ -239,11 +242,11 @@ def _send_email(to_email: str, subject: str, text_body: str, html_body: str,
 def send_verification_email(email: str, code: str) -> bool:
     """Envoie le code de vérification 6 chiffres — subject sans emoji pour éviter le spam."""
     # Pas d'emoji dans le subject : les filtres anti-spam les pénalisent
-    subject = f"Votre code de verification Parisk : {code}"
+    subject = f"Votre code de verification RiskAgri : {code}"
 
     text_body = f"""Bonjour,
 
-Votre code de verification Parisk est :
+Votre code de verification RiskAgri est :
 
   {code}
 
@@ -251,7 +254,7 @@ Ce code est valable 10 minutes.
 
 Si vous n'avez pas demande la creation d'un compte, ignorez cet email.
 
--- L'equipe Parisk""".strip()
+-- L'equipe RiskAgri""".strip()
 
     html_body = f"""<!DOCTYPE html>
 <html lang="fr">
@@ -260,7 +263,7 @@ Si vous n'avez pas demande la creation d'un compte, ignorez cet email.
   <div style="max-width:420px;margin:0 auto;background:#ffffff;border-radius:12px;
               overflow:hidden;border:1px solid #e2e8f0;">
     <div style="background:#27ae60;padding:24px 30px;">
-      <h1 style="color:#ffffff;margin:0;font-size:20px;font-weight:600;">Parisk</h1>
+      <h1 style="color:#ffffff;margin:0;font-size:20px;font-weight:600;">RiskAgri</h1>
       <p style="color:rgba(255,255,255,0.85);margin:6px 0 0;font-size:14px;">
         Verification de votre adresse email
       </p>
@@ -268,7 +271,7 @@ Si vous n'avez pas demande la creation d'un compte, ignorez cet email.
     <div style="padding:32px 30px;">
       <p style="color:#374151;font-size:15px;margin:0 0 24px;line-height:1.6;">
         Bonjour,<br><br>
-        Voici votre code de verification pour creer votre compte Parisk :
+        Voici votre code de verification pour creer votre compte RiskAgri :
       </p>
       <div style="text-align:center;margin:0 0 28px;">
         <div style="display:inline-block;background:#f0fdf4;border:2px solid #27ae60;
@@ -286,7 +289,7 @@ Si vous n'avez pas demande la creation d'un compte, ignorez cet email.
     </div>
     <div style="background:#f8fafc;padding:16px 30px;border-top:1px solid #e2e8f0;">
       <p style="color:#9ca3af;font-size:11px;margin:0;text-align:center;">
-        Parisk &middot; France &middot; Ne pas repondre a cet email
+        RiskAgri &middot; France &middot; Ne pas repondre a cet email
       </p>
     </div>
   </div>
@@ -298,11 +301,11 @@ Si vous n'avez pas demande la creation d'un compte, ignorez cet email.
 
 def send_reset_email(email: str, reset_link: str) -> bool:
     """Envoie le lien de réinitialisation de mot de passe."""
-    subject = "Reinitialisation de votre mot de passe Parisk"
+    subject = "Reinitialisation de votre mot de passe RiskAgri"
 
     text_body = f"""Bonjour,
 
-Vous avez demande la reinitialisation de votre mot de passe Parisk.
+Vous avez demande la reinitialisation de votre mot de passe RiskAgri.
 
 Cliquez sur ce lien pour choisir un nouveau mot de passe :
 {reset_link}
@@ -311,7 +314,7 @@ Ce lien est valable 30 minutes et ne peut etre utilise qu'une seule fois.
 
 Si vous n'avez pas fait cette demande, ignorez cet email.
 
--- L'equipe Parisk""".strip()
+-- L'equipe RiskAgri""".strip()
 
     html_body = f"""<!DOCTYPE html>
 <html lang="fr">
@@ -320,7 +323,7 @@ Si vous n'avez pas fait cette demande, ignorez cet email.
   <div style="max-width:420px;margin:0 auto;background:#ffffff;border-radius:12px;
               overflow:hidden;border:1px solid #e2e8f0;">
     <div style="background:#1d4ed8;padding:24px 30px;">
-      <h1 style="color:#ffffff;margin:0;font-size:20px;font-weight:600;">Parisk</h1>
+      <h1 style="color:#ffffff;margin:0;font-size:20px;font-weight:600;">RiskAgri</h1>
       <p style="color:rgba(255,255,255,0.85);margin:6px 0 0;font-size:14px;">
         Reinitialisation de mot de passe
       </p>
@@ -353,7 +356,7 @@ Si vous n'avez pas fait cette demande, ignorez cet email.
     </div>
     <div style="background:#f8fafc;padding:16px 30px;border-top:1px solid #e2e8f0;">
       <p style="color:#9ca3af;font-size:11px;margin:0;text-align:center;">
-        Parisk &middot; France &middot; Ne pas repondre a cet email
+        RiskAgri &middot; France &middot; Ne pas repondre a cet email
       </p>
     </div>
   </div>
@@ -401,6 +404,21 @@ def get_plan(user_id):
         row = cur.fetchone()
         return row[0] if row else 'free'
     except Exception: return 'free'
+    finally:
+        if conn: conn.close()
+
+def get_max_parcel(user_id):
+    """Retourne la limite de parcelles pour cet utilisateur.
+    Priorité : max_parcel (colonne Supabase) > FREE_PLAN_LIMIT (défaut 10)."""
+    conn = None
+    try:
+        conn = get_db(); cur = conn.cursor()
+        cur.execute("SELECT max_parcel FROM users_profiles WHERE id = %s", (user_id,))
+        row = cur.fetchone()
+        if row and row[0] is not None:
+            return int(row[0])
+        return FREE_PLAN_LIMIT
+    except Exception: return FREE_PLAN_LIMIT
     finally:
         if conn: conn.close()
 
@@ -597,43 +615,271 @@ def dist_to_geometry(lat, lon, geom):
     return min(haversine(lat, lon, p[1], p[0]) for p in pts)
 
 # ============================================================
-# VIGILANCE — cache mémoire (fichier mis à jour par GitHub Actions)
+# VIGILANCE (Météo-France) — mise à jour automatique toutes les heures
 # ============================================================
 
-# Constantes utilisées par /api/vigilance pour servir le cache
+# Noms et icônes des phénomènes Météo-France
+PHENOM_NAMES = {
+    1: "Vent violent", 2: "Pluie-inondation", 3: "Orages",
+    4: "Crues", 5: "Neige-verglas", 6: "Canicule",
+    7: "Grand froid", 8: "Avalanches", 9: "Vagues-submersion"
+}
+PHENOM_ICONS = {
+    1: "💨", 2: "🌧️", 3: "⛈️", 4: "🌊", 5: "❄️",
+    6: "🌡️", 7: "🥶", 8: "🏔️", 9: "🌊"
+}
 VIGI_COLORS = {1: "vert", 2: "jaune", 3: "orange", 4: "rouge"}
 VIGI_HEX    = {1: "#1e8449", 2: "#d97706", 3: "#c2410c", 4: "#b91c1c"}
 
 
+def _dept_from_domain_id(domain_id):
+    """
+    Valide et normalise un domain_id Météo-France.
+    Dans la réponse réelle, domain_id EST déjà le code département ("02", "17", "60"…).
+    On ignore les codes non-départementaux : "FRA", codes à 4 chiffres (zones marines ex: "3010"),
+    "99" (outre-mer global), etc.
+    """
+    if domain_id is None:
+        return None
+    s = str(domain_id).strip()
+
+    # Ignorer les codes non-départementaux
+    if s in ("FRA", "99", ""):
+        return None
+    # Codes à 4+ chiffres = zones côtières/marines (ex: "3010", "6410") → ignorer
+    if len(s) >= 4 and s.isdigit():
+        return None
+
+    # Corse
+    if s in ("2A", "2B"):
+        return s
+
+    # Code purement numérique sur 1 ou 2 chiffres
+    if s.isdigit():
+        n = int(s)
+        if 1 <= n <= 95:
+            return s.zfill(2)
+        return None  # DOM-TOM ou code invalide
+
+    return None
+
+
+def _parse_mf_alerts(raw):
+    """
+    Parse la réponse JSON de l'API DPVigilance v1 (cartevigilance/encours).
+
+    Structure réelle confirmée :
+      raw["product"]["periods"] = [
+        {
+          "echeance": "J",
+          "timelaps": {
+            "domain_ids": [
+              {
+                "domain_id": "02",          ← code département directement
+                "max_color_id": 2,           ← max sur la période (1=vert,2=jaune,3=orange,4=rouge)
+                "phenomenon_items": [
+                  {
+                    "phenomenon_id": "4",
+                    "phenomenon_max_color_id": 2,
+                    "timelaps_items": [...]
+                  }
+                ]
+              },
+              ...
+            ]
+          }
+        },
+        { "echeance": "J1", ... }  ← deuxième période éventuelle
+      ]
+
+    On prend le max_color_id le plus élevé toutes périodes confondues pour chaque
+    couple (département, phénomène).
+    """
+    alerts_map = {}  # (dept, phenomenon_id) → meilleure alerte
+
+    if not raw:
+        return []
+
+    product = raw.get("product", {})
+    periods = product.get("periods", [])
+
+    for period in periods:
+        echeance   = period.get("echeance", "")
+        begin_time = period.get("begin_validity_time", "")
+        end_time   = period.get("end_validity_time",   "")
+        timelaps   = period.get("timelaps", {})
+        domain_ids = timelaps.get("domain_ids", [])
+
+        for d in domain_ids:
+            raw_did = d.get("domain_id")
+            dept    = _dept_from_domain_id(raw_did)
+            if not dept:
+                continue  # FRA, zones marines, DOM-TOM → ignorés
+
+            max_color = int(d.get("max_color_id", 1) or 1)
+            if max_color < 2:
+                continue  # vert = pas de vigilance
+
+            # Parcourir chaque phénomène de ce département sur cette période
+            for ph in d.get("phenomenon_items", []):
+                ph_id    = ph.get("phenomenon_id")
+                ph_color = int(ph.get("phenomenon_max_color_id", 1) or 1)
+
+                if ph_color < 2:
+                    continue  # ce phénomène est vert sur ce département
+
+                try:
+                    ph_id_int = int(ph_id)
+                except (ValueError, TypeError):
+                    continue
+
+                key = (dept, ph_id_int)
+                if key not in alerts_map or ph_color > alerts_map[key]["level"]:
+                    alerts_map[key] = {
+                        "dept":       dept,
+                        "domain_id":  str(raw_did),
+                        "level":      ph_color,
+                        "phenomenon": ph_id_int,
+                        "colorName":  VIGI_COLORS.get(ph_color, "jaune"),
+                        "colorHex":   VIGI_HEX.get(ph_color,    "#d97706"),
+                        "phenomName": PHENOM_NAMES.get(ph_id_int, "Vigilance"),
+                        "phenomIcon": PHENOM_ICONS.get(ph_id_int, "⚠️"),
+                        "dateDebut":  begin_time,
+                        "dateFin":    end_time,
+                        "echeance":   echeance,
+                    }
+
+    result = sorted(alerts_map.values(), key=lambda x: (x["dept"], -x["level"]))
+
+    print(f"[Vigilance] {len(result)} alertes parsées "
+          f"({len([a for a in result if a['level']==4])} rouge, "
+          f"{len([a for a in result if a['level']==3])} orange, "
+          f"{len([a for a in result if a['level']==2])} jaune) "
+          f"— depts: {sorted(set(a['dept'] for a in result))}")
+    return result
+
+
 def update_vigilance():
     """
-    Charge vigilance_active.geojson en cache mémoire.
-    Le fichier est mis à jour toutes les 5h par GitHub Actions (update_vigilance.py).
-    Cette fonction est appelée une seule fois au démarrage de l'app.
+    Récupère la carte de vigilance Météo-France via l'API DPVigilance/v1,
+    parse les domain_id (2 premiers chiffres = département, max_color_id = niveau),
+    et enrichit vigilance_active.geojson (points lat/lon par département)
+    en y injectant les alertes du département.
+    Appelé automatiquement toutes les heures par le scheduler APScheduler.
     """
     global _vigilance_cache
-    if not os.path.exists(VIGILANCE_OUTPUT):
-        print("[Vigilance] Fichier introuvable — cache non chargé")
+    updated_at = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None).isoformat()
+
+    # ── 1. Charger le fichier de base (points départements) ──
+    # vigilance_active.geojson contient 1 Point par département avec code + departement
+    base_features = []
+    if os.path.exists(VIGILANCE_OUTPUT):
+        try:
+            with open(VIGILANCE_OUTPUT, 'r', encoding='utf-8') as f:
+                base_gj = json.load(f)
+            for feat in base_gj.get("features", []):
+                props = feat.get("properties", {})
+                code = props.get("code", "")
+                dept_name = props.get("departement", "")
+                if not code and not dept_name:
+                    continue
+                # Extraire uniquement les propriétés de base (sans les données de vigilance injectées)
+                base_features.append({
+                    "type": "Feature",
+                    "properties": {
+                        "code":        str(code).strip(),
+                        "departement": dept_name,
+                    },
+                    "geometry": feat.get("geometry"),
+                })
+        except Exception as e:
+            print(f"[Vigilance] Erreur lecture fichier base: {e}")
+
+    if not base_features:
+        print("[Vigilance] Aucun département dans vigilance_active.geojson — abandon")
         return
+
+    # ── 2. Appel API Météo-France ──
+    alerts = []
+    api_ok = False
     try:
-        with open(VIGILANCE_OUTPUT, "r", encoding="utf-8") as f:
-            gj = json.load(f)
-        alerts = [
-            a for feat in gj.get("features", [])
-            for a in feat.get("properties", {}).get("vigi_alerts", [])
-        ]
-        _vigilance_cache = {
-            "alerts":     alerts,
-            "geojson":    gj,
-            "updated_at": gj.get("updated_at"),
-        }
-        n_alert = sum(1 for feat in gj.get("features", [])
-                      if feat.get("properties", {}).get("vigi_level", 1) >= 2)
-        print(f"[Vigilance] Cache chargé — {len(alerts)} alertes, "
-              f"{n_alert} depts en vigilance, "
-              f"updated_at={gj.get('updated_at', '?')}")
+        headers = {"apikey": MF_API_KEY, "Accept": "application/json"}
+        resp = requests.get(MF_VIGI_URL, headers=headers, timeout=15)
+        if resp.status_code == 200:
+            raw = resp.json()
+            alerts = _parse_mf_alerts(raw)
+            api_ok = True
+        else:
+            print(f"[Vigilance] API HTTP {resp.status_code} — données précédentes conservées dans le fichier")
     except Exception as e:
-        print(f"[Vigilance] Erreur chargement cache: {e}")
+        print(f"[Vigilance] Erreur appel API: {e}")
+
+    # Si l'API échoue, on recharge les alertes depuis le fichier existant pour conserver le cache mémoire
+    if not api_ok and _vigilance_cache:
+        print("[Vigilance] Conservation du cache mémoire existant")
+        return
+
+    # ── 3. Indexer les alertes par département ──
+    # {dept_code: [alert, ...]}  — un dept peut avoir plusieurs phénomènes
+    alerts_by_dept: dict = {}
+    for a in alerts:
+        dept = a["dept"]
+        alerts_by_dept.setdefault(dept, []).append(a)
+
+    # Niveau max par département
+    max_level_by_dept: dict = {
+        dept: max(a["level"] for a in lst)
+        for dept, lst in alerts_by_dept.items()
+    }
+
+    # ── 4. Enrichir chaque feature de base avec les alertes du département ──
+    enriched_features = []
+    for feat in base_features:
+        props = feat["properties"].copy()
+        code  = props["code"].strip()
+        # Normaliser le code : "1" → "01", "17" reste "17", "2A"/"2B" inchangés
+        if code.isdigit():
+            code = code.zfill(2)
+        dept_alerts = alerts_by_dept.get(code, [])
+        max_lvl     = max_level_by_dept.get(code, 1)  # 1 = vert (pas de vigilance)
+
+        props["dept_num"]       = code
+        props["vigi_level"]     = max_lvl
+        props["vigi_colorName"] = VIGI_COLORS.get(max_lvl, "vert")
+        props["vigi_colorHex"]  = VIGI_HEX.get(max_lvl,    "#1e8449")
+        props["vigi_alerts"]    = dept_alerts   # liste des alertes par phénomène pour ce dept
+        props["updated_at"]     = updated_at
+
+        enriched_features.append({
+            "type":       "Feature",
+            "properties": props,
+            "geometry":   feat["geometry"],
+        })
+
+    enriched_geojson = {
+        "type":       "FeatureCollection",
+        "features":   enriched_features,
+        "updated_at": updated_at,
+    }
+
+    # ── 5. Mettre à jour le cache mémoire ──
+    _vigilance_cache = {
+        "alerts":     alerts,
+        "geojson":    enriched_geojson,
+        "updated_at": updated_at,
+    }
+
+    # ── 6. Écrire le fichier vigilance_active.geojson enrichi ──
+    try:
+        out_dir = os.path.dirname(os.path.abspath(VIGILANCE_OUTPUT))
+        os.makedirs(out_dir, exist_ok=True)
+        with open(VIGILANCE_OUTPUT, 'w', encoding='utf-8') as f:
+            json.dump(enriched_geojson, f, ensure_ascii=False)
+        n_alert = len([f for f in enriched_features if f["properties"].get("vigi_level", 1) >= 2])
+        print(f"[Vigilance] ✅ Fichier mis à jour — {len(enriched_features)} départements "
+              f"dont {n_alert} en vigilance · {updated_at}")
+    except Exception as e:
+        print(f"[Vigilance] Erreur écriture fichier: {e}")
 
 # ============================================================
 # TRI ANALYSIS
@@ -734,7 +980,21 @@ def compute_mvt_risk(geometry):
         commune = props.get('commune') or props.get('Commune') or props.get('COMMUNE') or '—'
         type_mvt = props.get('typeMvt') or props.get('type_mvt') or props.get('TYPE_MVT') or 0
         date_debut = props.get('dateDebut') or props.get('date_debut') or ''
-        entry = {"commune": commune, "distance_km": round(d, 2), "typeMvt": type_mvt, "dateDebut": date_debut}
+        geom_coords = geom.get("coordinates", [])
+        if geom.get("type") == "Point" and len(geom_coords) >= 2:
+              pt_lon, pt_lat = float(geom_coords[0]), float(geom_coords[1])
+        else:
+            flat_pts = flatten_coords(geom_coords)
+            pt_lon = sum(c[0] for c in flat_pts)/len(flat_pts) if flat_pts else None
+            pt_lat = sum(c[1] for c in flat_pts)/len(flat_pts) if flat_pts else None
+        entry = {
+           "commune": commune,
+           "distance_km": round(d, 2),
+           "typeMvt": type_mvt,
+           "dateDebut": date_debut,
+           "longitude": pt_lon,
+           "latitude": pt_lat,
+        }
         if d < best_dist: best_dist = d; nearest = entry
         if d < 50: nearby.append(entry)
     nearby.sort(key=lambda x: x['distance_km'])
@@ -974,7 +1234,7 @@ def geocode():
     try:
         fr_resp = requests.get(
             f"https://api-adresse.data.gouv.fr/search/?q={requests.utils.quote(q)}&limit=5",
-            timeout=5, headers={"User-Agent": "Parisk/1.0"}
+            timeout=5, headers={"User-Agent": "RiskAgri/1.0"}
         )
         if fr_resp.status_code == 200:
             fr_data = fr_resp.json()
@@ -984,7 +1244,7 @@ def geocode():
         nom_resp = requests.get(
             "https://nominatim.openstreetmap.org/search",
             params={"q": q, "format": "geojson", "limit": 6, "addressdetails": 1},
-            timeout=8, headers={"User-Agent": "Parisk/1.0 contact@parisk.fr"}
+            timeout=8, headers={"User-Agent": "RiskAgri/1.0 contact@RiskAgri.fr"}
         )
         if nom_resp.status_code == 200:
             data = nom_resp.json()
@@ -1515,7 +1775,7 @@ def export_user_data():
         if isinstance(prefs, str): prefs = json.loads(prefs)
 
         export = {
-            "parisk_export": {
+            "RiskAgri_export": {
                 "version": "1.0",
                 "exported_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
                 "user": {
@@ -1550,7 +1810,7 @@ def export_user_data():
             json.dumps(export, ensure_ascii=False, indent=2),
             mimetype='application/json',
             headers={
-                'Content-Disposition': f'attachment; filename="parisk_export_{user["id"]}.json"'
+                'Content-Disposition': f'attachment; filename="RiskAgri_export_{user["id"]}.json"'
             }
         )
         return resp
@@ -1562,6 +1822,15 @@ def export_user_data():
 # ============================================================
 # PARCELLES ROUTES
 # ============================================================
+@app.route('/api/parcelles/max', methods=['GET'])
+@require_auth
+def get_parcel_max():
+    """Retourne la limite de parcelles pour le compte connecté.
+    La colonne max_parcel peut être modifiée directement dans Supabase pour chaque client."""
+    user = request.current_user
+    limit = get_max_parcel(user['id'])
+    return jsonify({"max_parcel": limit})
+
 @app.route('/api/parcelles/saved', methods=['GET'])
 @require_auth
 def get_saved_parcels():
@@ -1586,10 +1855,10 @@ def save_parcels():
     try:
         conn=get_db(); cur=conn.cursor(cursor_factory=RealDictCursor)
         cur.execute("SELECT selected_zones FROM users_profiles WHERE id = %s",(user['id'],))
-        row=cur.fetchone(); plan=get_plan(user['id'])
+        row=cur.fetchone()
         existing=row['selected_zones'] if row else []
         if isinstance(existing,str): existing=json.loads(existing)
-        existing=existing or []; limit=FREE_PLAN_LIMIT if plan=='free' else 999999
+        existing=existing or []; limit=get_max_parcel(user['id'])
         existing_ids={p['id'] for p in existing if isinstance(p,dict) and 'id' in p}
         def geom_hash(p):
             g = p.get('geometry')
@@ -1663,32 +1932,191 @@ def update_parcel(parcel_id):
     finally:
         if conn: conn.close()
 
-# ============================================================
-# STARTUP — fonctionne avec python app.py ET gunicorn app:app
-# ============================================================
-def _startup():
-    """
-    Initialise l'application au démarrage.
-    - Vérifie/crée les tables DB
-    - Charge TRI et MVT en mémoire
-    - Charge vigilance_active.geojson en cache mémoire
-      (le fichier est mis à jour toutes les 5h par GitHub Actions)
 
-    Guard WERKZEUG_RUN_MAIN : évite la double exécution avec le reloader Werkzeug.
-    """
-    # En mode debug Werkzeug, ne s'exécuter que dans le processus worker
-    run_main = os.environ.get('WERKZEUG_RUN_MAIN')
-    if run_main is not None and run_main != 'true':
-        return  # processus reloader → skip
+# ============================================================
+# INCENDIE (BDIFF 2004-2024)
+# ============================================================
+def load_incendie():
+    global _incendie_cache
+    if _incendie_cache is not None: return _incendie_cache
+    if not os.path.exists(INCENDIE_GEOJSON_PATH):
+        print(f"[Incendie] Fichier non trouvé : {INCENDIE_GEOJSON_PATH}")
+        return None
+    try:
+        with open(INCENDIE_GEOJSON_PATH, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        _incendie_cache = data
+        print(f"[Incendie] {len(data.get('features',[]))} incendies chargés")
+        return _incendie_cache
+    except Exception as e:
+        print(f"[Incendie] load error: {e}"); return None
 
+def compute_incendie_risk(geometry, lat=None, lon=None):
+    inc = load_incendie()
+    if lat is None or lon is None:
+        lat, lon = get_centroid_from_geometry(geometry)
+    if lat is None: return {"risk_level": "unknown", "risk_label": "Données insuffisantes", "stats": None}
+    current_year = datetime.date.today().year
+    nearby = []
+    if inc and inc.get("features"):
+        for feat in inc["features"]:
+            props = feat.get("properties", {})
+            geom = feat.get("geometry")
+            if not geom: continue
+            coords = geom.get("coordinates", [])
+            if geom.get("type") == "Point" and len(coords) >= 2:
+                f_lon, f_lat = float(coords[0]), float(coords[1])
+            else:
+                flat = flatten_coords(coords)
+                if not flat: continue
+                f_lon = sum(c[0] for c in flat) / len(flat)
+                f_lat = sum(c[1] for c in flat) / len(flat)
+            d = haversine(lat, lon, f_lat, f_lon)
+            if d <= 30:
+                surface_m2 = float(
+    props.get("Surface parcourue (m2)",
+    props.get("surface parcourue (m2)", 0)) or 0
+)
+                annee_raw = props.get("Année", props.get("annee", props.get("Annee", "")))
+                try: annee = int(annee_raw)
+                except: annee = 0
+                nearby.append({
+                    "annee": annee_raw,
+                    "commune": props.get("Nom de la commune", ""),
+                    "dept": str(props.get("Département", "")),
+                    "date_alerte": props.get("Date de première alerte", ""),
+                    "surface_m2": surface_m2,
+                    "surface_ha": round(surface_m2 / 10000, 2),
+                    "distance_km": round(d, 2),
+                    "_annee_int": annee,
+                })
+    nearby.sort(key=lambda x: x["distance_km"])
+    stats_5  = [x for x in nearby if (current_year - x["_annee_int"]) <= 5  and x["_annee_int"] > 0]
+    stats_10 = [x for x in nearby if (current_year - x["_annee_int"]) <= 10 and x["_annee_int"] > 0]
+    total_surface_5  = sum(x["surface_ha"] for x in stats_5)
+    total_surface_10 = sum(x["surface_ha"] for x in stats_10)
+    score = min(len(stats_5)*8, 40) + min(len(stats_10)*4, 30) + min(total_surface_5/100, 20) + min(total_surface_10/500, 10)
+    if score >= 60:   risk_level, risk_label = "very_high", "Risque très élevé"
+    elif score >= 35: risk_level, risk_label = "high",      "Risque élevé"
+    elif score >= 15: risk_level, risk_label = "medium",    "Risque modéré"
+    elif score > 0:   risk_level, risk_label = "low",       "Risque faible"
+    else:             risk_level, risk_label = "safe",       "Aucun historique proche"
+    top5_clean = [{k:v for k,v in x.items() if k != "_annee_int"} for x in nearby[:5]]
+    s5_clean   = [{k:v for k,v in x.items() if k != "_annee_int"} for x in stats_5[:5]]
+    return {
+        "risk_level": risk_level, "risk_label": risk_label, "score": round(score, 1),
+        "n_total_30km": len(nearby), "n_5ans": len(stats_5), "n_10ans": len(stats_10),
+        "total_surface_5ans_ha": round(total_surface_5, 2),
+        "total_surface_10ans_ha": round(total_surface_10, 2),
+        "nearest": top5_clean[0] if top5_clean else None,
+        "top5": top5_clean,
+        "stats_5ans": s5_clean,
+    }
+
+@app.route('/api/incendie/analyse', methods=['POST'])
+def incendie_analyse():
+    data = request.json or {}
+    parcels = data.get('parcels', [])
+    results = []
+    for p in parcels:
+        geometry = p.get('geometry')
+        if not geometry:
+            results.append({"parcel_id": p.get('id'), "risk_level": "unknown", "risk_label": "—"}); continue
+        lat, lon = get_centroid_from_geometry(geometry)
+        risk = compute_incendie_risk(geometry, lat, lon)
+        meteo_risk = None
+        if lat is not None:
+            try:
+                params = {
+                    "latitude": lat, "longitude": lon,
+                    "current": "temperature_2m,relative_humidity_2m,wind_speed_10m,wind_direction_10m,precipitation",
+                    "daily": "temperature_2m_max,relative_humidity_2m_min,wind_speed_10m_max,precipitation_sum",
+                    "forecast_days": 3, "timezone": "auto",
+                }
+                resp = requests.get(OPEN_METEO_URL, params=params, timeout=10)
+                if resp.status_code == 200:
+                    raw = resp.json()
+                    cur = raw.get("current", {})
+                    temp = cur.get("temperature_2m"); hum = cur.get("relative_humidity_2m")
+                    wind = cur.get("wind_speed_10m"); precip = cur.get("precipitation", 0)
+                    wind_dir = cur.get("wind_direction_10m")
+                    def fwi_calc(t, h, w, p):
+                        s = 0
+                        if t and t > 30: s += 25
+                        elif t and t > 25: s += 15
+                        if h and h < 20: s += 30
+                        elif h and h < 35: s += 15
+                        if w and w > 40: s += 25
+                        elif w and w > 20: s += 10
+                        if not p or p < 0.1: s += 10
+                        return s
+                    def fwi_label(s): return "très élevé" if s>=60 else "élevé" if s>=35 else "modéré" if s>=15 else "faible"
+                    fwi = fwi_calc(temp, hum, wind, precip)
+                    daily = raw.get("daily", {})
+                    dates = daily.get("time", [None, None, None])
+                    tmx1 = daily.get("temperature_2m_max", [None,None])[1] if len(daily.get("temperature_2m_max",[])) > 1 else None
+                    hmn1 = daily.get("relative_humidity_2m_min", [None,None])[1] if len(daily.get("relative_humidity_2m_min",[])) > 1 else None
+                    wmx1 = daily.get("wind_speed_10m_max", [None,None])[1] if len(daily.get("wind_speed_10m_max",[])) > 1 else None
+                    pc1  = daily.get("precipitation_sum", [None,None])[1] if len(daily.get("precipitation_sum",[])) > 1 else None
+                    fwi1 = fwi_calc(tmx1, hmn1, wmx1, pc1)
+                    meteo_risk = {
+                        "temperature": temp, "humidity": hum, "wind_speed": wind,
+                        "wind_dir": wind_dir, "wind_arrow": deg_to_arrow(wind_dir or 0),
+                        "precipitation": precip, "fwi_score": fwi, "fwi_level": fwi_label(fwi),
+                        "date_j": dates[0] if dates else None,
+                        "j1": {
+                            "date": dates[1] if len(dates) > 1 else None,
+                            "temp_max": tmx1, "hum_min": hmn1,
+                            "wind_max": wmx1, "precipitation": pc1,
+                            "fwi_score": fwi1, "fwi_level": fwi_label(fwi1),
+                        }
+                    }
+            except Exception as e:
+                print(f"[Incendie meteo] {e}")
+        results.append({"parcel_id": p.get('id'), "parcel_label": p.get('label', ''), "meteo_risk": meteo_risk, **risk})
+    return jsonify({"results": results})
+
+# ============================================================
+# STARTUP
+# ============================================================
+if __name__ == '__main__':
     ensure_tables()
     load_tri()
     load_mvt()
-    update_vigilance()  # charge le fichier GH Actions en cache mémoire
+    load_incendie()
 
+    # APScheduler ne doit démarrer que dans le processus principal de Flask.
+    # Avec debug=True, Werkzeug lance 2 processus (reloader + worker).
+    # On utilise la variable WERKZEUG_RUN_MAIN pour ne lancer le scheduler
+    # que dans le processus worker, évitant les doubles déclenchements.
+    import os as _os
+    _is_main_process = not _os.environ.get('WERKZEUG_RUN_MAIN') or _os.environ.get('WERKZEUG_RUN_MAIN') == 'true'
+    if _is_main_process:
+        # Charger les données de vigilance depuis le fichier existant au démarrage
+        # (sans appeler l'API MF pour ne pas bloquer le démarrage)
+        if os.path.exists(VIGILANCE_OUTPUT):
+            try:
+                with open(VIGILANCE_OUTPUT, 'r', encoding='utf-8') as _f:
+                    _gj = json.load(_f)
+                _vigilance_cache = {
+                    "alerts": [
+                        a for feat in _gj.get("features", [])
+                        for a in feat.get("properties", {}).get("vigi_alerts", [])
+                    ],
+                    "geojson": _gj,
+                    "updated_at": _gj.get("updated_at")
+                }
+                print(f"[Vigilance] Cache initialisé depuis fichier existant · {len(_vigilance_cache['alerts'])} alertes")
+            except Exception as _e:
+                print(f"[Vigilance] Impossible de lire le fichier existant: {_e}")
 
-# Exécution à l'import du module → compatible Gunicorn ET python app.py
-_startup()
+        scheduler = BackgroundScheduler(daemon=True)
+        # Déclenchement 1 minute après le démarrage (pas immédiat) puis toutes les heures
+        _first_run = datetime.datetime.now() + datetime.timedelta(minutes=1)
+        scheduler.add_job(update_vigilance, 'interval', hours=1,
+                          id='vigilance_update', next_run_time=_first_run,
+                          misfire_grace_time=300, coalesce=True)
+        scheduler.start()
+        print(f"[Scheduler] Vigilance planifiée : premier appel à {_first_run.strftime('%H:%M:%S')}, puis toutes les heures")
 
-if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000, debug=True, use_reloader=True)
