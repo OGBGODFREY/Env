@@ -1,6 +1,5 @@
 from flask import Flask, jsonify, request, send_from_directory
 from flask_cors import CORS
-from apscheduler.schedulers.background import BackgroundScheduler
 import json, os, math, requests, datetime, re, secrets, random
 import psycopg2
 from psycopg2.extras import RealDictCursor
