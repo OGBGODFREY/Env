@@ -2111,12 +2111,33 @@ else:
     print("[TTS] ⚠️ ATTENTION : L'exécutable Piper ou le modèle est introuvable !")
 
 
-# ── Route TTS ─────────────────────────────────────────────────────────────
+# 1. LA FONCTION QUI PILOTE PIPER (À mettre AVANT la route)
+def generate_audio(text, output_path):
+    _APP_DIR = os.path.dirname(os.path.abspath(__file__))
+    
+    # Choix du moteur selon l'OS
+    if os.name == 'nt':  # Windows
+        piper_path = os.path.join(_APP_DIR, "piper", "piper.exe")
+    else:  # Linux (Render)
+        piper_path = os.path.join(_APP_DIR, "piper", "piper")
 
-# ✅ REMPLACE TOUT LE BLOC DE LA ROUTE PAR CECI :
+    model_path = os.path.join(_APP_DIR, "models", "fr_FR-siwis-low.onnx")
+
+    # Commande pour exécuter Piper
+    command = [
+        piper_path,
+        "-m", model_path,
+        "-f", output_path
+    ]
+
+    # Exécution
+    process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    process.communicate(input=text)
+
+
+# 2. LA ROUTE API (Tu l'as déjà, mais je te la remets propre en dessous)
 @app.route('/api/tts', methods=['POST', 'OPTIONS'])
 def tts():
-    # 1. Gestion du CORS pour que Netlify ait le droit de parler à Render
     if request.method == 'OPTIONS':
         return '', 200
         
@@ -2126,18 +2147,15 @@ def tts():
     if not text:
         return jsonify({"error": "Aucun texte fourni"}), 400
         
-    # 2. Génération d'un nom unique pour le fichier audio
     filename = f"{uuid.uuid4()}.wav"
     output_path = os.path.join(AUDIO_OUTPUT_DIR, filename)
     
-    # 3. Appel de ta fonction de génération (elle marche déjà super bien !)
+    # C'est ici qu'on appelle la fonction définie juste au-dessus !
     generate_audio(text, output_path)
     
-    # 4. LA MAGIE : On crée une URL complète (ex: https://env-intel.onrender.com/...)
     base_url = request.host_url.rstrip('/')
     audio_url = f"{base_url}/static/audio/{filename}"
     
-    # 5. On renvoie l'URL complète au Frontend
     return jsonify({"audio_url": audio_url})
 
     # Nettoyage rapide du texte pour éviter les sauts de ligne intempestifs
