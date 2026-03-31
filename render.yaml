@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: Env
+    name: Env-intel
     env: python
     plan: free          # ou free si tu veux tester
     buildCommand: |
