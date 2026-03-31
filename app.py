@@ -2087,16 +2087,20 @@ def incendie_analyse():
     return jsonify({"results": results})
 
 
-# ── Configuration Piper (Adaptée à ta structure) ───────────────────────────
+# Détection dynamique du dossier de l'application
+_APP_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# On s'assure que _APP_DIR est bien défini. Si ce n'est pas le cas, décommente la ligne suivante :
-# _APP_DIR = os.path.dirname(os.path.abspath(__file__))
+# Détection automatique de l'exécutable (Windows vs Linux)
+if os.name == 'nt':  # Si tu es sur ton PC (Windows)
+    PIPER_EXE = os.path.join(_APP_DIR, "piper", "piper.exe")
+else:  # Si tu es sur Render (Linux)
+    PIPER_EXE = os.path.join(_APP_DIR, "piper", "piper")
 
-PIPER_EXE = os.path.join(_APP_DIR, "piper", "piper.exe")
+# Le reste ne change pas (les fichiers .onnx et les dossiers sont identiques)
 MODEL_PATH = os.path.join(_APP_DIR, "models", "fr_FR-siwis-low.onnx")
 AUDIO_OUTPUT_DIR = os.path.join(_APP_DIR, "static", "audio")
 
-# Créer le dossier audio s'il n'existe pas
+# Création du dossier audio s'il n'existe pas (sécurité pour Render)
 os.makedirs(AUDIO_OUTPUT_DIR, exist_ok=True)
 
 # Vérification au démarrage pour la console
