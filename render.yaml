@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: riskagri-backend
+    name: Env
     env: python
     plan: free          # ou free si tu veux tester
     buildCommand: |
