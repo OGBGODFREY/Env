@@ -1,5 +1,10 @@
+import wave
+from piper.voice import PiperVoice
+import subprocess
+import json, os, math, requests, datetime, re, secrets, random, time
 from flask import Flask, jsonify, request, send_from_directory
 from flask_cors import CORS
+from apscheduler.schedulers.background import BackgroundScheduler
 import json, os, math, requests, datetime, re, secrets, random
 import psycopg2
 from psycopg2.extras import RealDictCursor
@@ -43,6 +48,13 @@ except ImportError:
 
 app = Flask(__name__)
 CORS(app, supports_credentials=True)
+
+#Lancement Backend
+
+@app.route('/api/ping', methods=['GET'])
+def ping():
+    return jsonify({"status": "ok"}), 200
+
 
 # ============================================================
 # CONFIG — toutes les clés viennent du fichier .env
@@ -2075,6 +2087,129 @@ def incendie_analyse():
         results.append({"parcel_id": p.get('id'), "parcel_label": p.get('label', ''), "meteo_risk": meteo_risk, **risk})
     return jsonify({"results": results})
 
+
+# ── Configuration Piper (Adaptée à ta structure) ───────────────────────────
+
+# On s'assure que _APP_DIR est bien défini. Si ce n'est pas le cas, décommente la ligne suivante :
+# _APP_DIR = os.path.dirname(os.path.abspath(__file__))
+
+PIPER_EXE = os.path.join(_APP_DIR, "piper", "piper.exe")
+MODEL_PATH = os.path.join(_APP_DIR, "models", "fr_FR-siwis-low.onnx")
+AUDIO_OUTPUT_DIR = os.path.join(_APP_DIR, "static", "audio")
+
+# Créer le dossier audio s'il n'existe pas
+os.makedirs(AUDIO_OUTPUT_DIR, exist_ok=True)
+
+# Vérification au démarrage pour la console
+if os.path.exists(PIPER_EXE) and os.path.exists(MODEL_PATH):
+    print("[TTS] Moteur Piper (Standalone) et modèle ONNX détectés avec succès.")
+else:
+    print("[TTS] ⚠️ ATTENTION : L'exécutable Piper ou le modèle est introuvable !")
+
+
+# ── Route TTS ─────────────────────────────────────────────────────────────
+
+@app.route('/api/tts', methods=['POST'])
+def text_to_speech():
+    # On vérifie que les fichiers nécessaires existent avant de lancer l'opération
+    if not os.path.exists(PIPER_EXE) or not os.path.exists(MODEL_PATH):
+        return jsonify({"error": "Moteur TTS ou modèle non disponible sur le serveur"}), 500
+    
+    data = request.json
+    text = data.get('text', '')
+    
+    if not text or not text.strip():
+        return jsonify({"error": "Aucun texte fourni"}), 400
+
+    # Nettoyage rapide du texte pour éviter les sauts de ligne intempestifs
+    clean_text = text.replace('\n', ' ').strip()
+
+    # Générer un nom de fichier unique pour éviter les conflits
+    filename = f"speech_{secrets.token_hex(4)}.wav"
+    filepath = os.path.join(AUDIO_OUTPUT_DIR, filename)
+
+    try:
+        # Commande sécurisée sans passer par le shell Windows pour éviter les bugs d'accents
+        command = [
+            PIPER_EXE, 
+            "--model", MODEL_PATH, 
+            "--output_file", filepath
+        ]
+        
+        print(f"[TTS] Génération audio en cours pour : '{clean_text[:50]}...'")
+        
+        # On lance Piper et on lui injecte le texte directement
+        subprocess.run(
+            command, 
+            input=clean_text, 
+            text=True, 
+            encoding='utf-8', 
+            check=True
+        )
+        
+        # Double vérification que le fichier s'est bien créé et n'est pas vide
+        if os.path.exists(filepath) and os.path.getsize(filepath) > 44:
+            # Retourne l'URL pour que le frontend puisse le lire
+            return jsonify({
+                "audio_url": f"/static/audio/{filename}",
+                "status": "success"
+            })
+        else:
+            raise Exception("Le fichier audio généré est vide ou invalide.")
+            
+    except subprocess.CalledProcessError as e:
+        print(f"[TTS] Erreur lors de l'exécution de Piper : {e}")
+        return jsonify({"error": "Échec de la génération de la voix par le moteur."}), 500
+    except Exception as e:
+        print(f"[TTS] Erreur synthèse : {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+# ── Route pour servir les fichiers audio ──────────────────────────────────
+
+@app.route('/static/audio/<filename>')
+def serve_audio(filename):
+    return send_from_directory(AUDIO_OUTPUT_DIR, filename)
+
+
+# ── Nettoyage audio automatique ──────────────────────────────────────────
+
+def cleanup_audio():
+    print("[TTS] Nettoyage des vieux fichiers audio...")
+    now = time.time()
+    if not os.path.exists(AUDIO_OUTPUT_DIR):
+        return
+        
+    for f in os.listdir(AUDIO_OUTPUT_DIR):
+        f_path = os.path.join(AUDIO_OUTPUT_DIR, f)
+        # Supprime si le fichier a plus de 15 minutes (900 secondes)
+        if os.stat(f_path).st_mtime < now - 900:
+            try:
+                os.remove(f_path)
+                print(f"[TTS] Fichier supprimé : {f}")
+            except Exception as e:
+                print(f"[TTS] Impossible de supprimer {f} : {e}")
+
+# On garde ton scheduler exactement comme tu l'as configuré
+scheduler = BackgroundScheduler()
+scheduler.add_job(func=cleanup_audio, trigger="interval", minutes=15)
+scheduler.start()
+
+
+
+#Lancement___________________
+
+@app.route('/')
+def index():
+    # Envoie le fichier HTML au navigateur
+    return send_from_directory('.', 'index.html')
+
+@app.route('/analyse_brain.js')
+def serve_js():
+    # Envoie le fichier JS au navigateur
+    return send_from_directory('.', 'analyse_brain.js')
+
+
 # ============================================================
 # STARTUP
 # ============================================================
@@ -2119,3 +2254,4 @@ if __name__ == '__main__':
         print(f"[Scheduler] Vigilance planifiée : premier appel à {_first_run.strftime('%H:%M:%S')}, puis toutes les heures")
 
     app.run(host='0.0.0.0', port=5000, debug=True, use_reloader=True)
+
