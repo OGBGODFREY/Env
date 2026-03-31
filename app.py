@@ -47,7 +47,17 @@ except ImportError:
     print("[Email] sendgrid non installé — pip install sendgrid")
 
 app = Flask(__name__)
-CORS(app, supports_credentials=True)
+CORS(app, supports_credentials=True, resources={
+    r"/api/*": {
+        "origins": [
+            "http://localhost:*",
+            "https://*.netlify.app",
+            "https://ton-domaine-custom.com"  # si tu en as un
+        ]
+    },
+    r"/static/*": {"origins": "*"},
+    r"/reset-password": {"origins": "*"},
+})
 
 #Lancement Backend
 
@@ -1569,10 +1579,14 @@ def reset_password():
         if conn: conn.close()
 
 
+# Dans app.py, remplace la route reset_password_page :
 @app.route('/reset-password')
 def reset_password_page():
-    """Sert index.html pour que le frontend gère le token via ?token=XXX."""
-    return send_from_directory('.', 'index.html')
+    # Rediriger vers le frontend Netlify
+    netlify_url = os.environ.get('FRONTEND_URL', 'https://ton-site.netlify.app')
+    token = request.args.get('token', '')
+    from flask import redirect
+    return redirect(f"{netlify_url}?token={token}")
 
 
 @app.route('/api/auth/login', methods=['POST'])
