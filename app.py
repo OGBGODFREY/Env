@@ -2112,17 +2112,32 @@ else:
 
 # ── Route TTS ─────────────────────────────────────────────────────────────
 
-@app.route('/api/tts', methods=['POST'])
-def text_to_speech():
-    # On vérifie que les fichiers nécessaires existent avant de lancer l'opération
-    if not os.path.exists(PIPER_EXE) or not os.path.exists(MODEL_PATH):
-        return jsonify({"error": "Moteur TTS ou modèle non disponible sur le serveur"}), 500
-    
-    data = request.json
+# ✅ REMPLACE TOUT LE BLOC DE LA ROUTE PAR CECI :
+@app.route('/api/tts', methods=['POST', 'OPTIONS'])
+def tts():
+    # 1. Gestion du CORS pour que Netlify ait le droit de parler à Render
+    if request.method == 'OPTIONS':
+        return '', 200
+        
+    data = request.get_json()
     text = data.get('text', '')
     
-    if not text or not text.strip():
+    if not text:
         return jsonify({"error": "Aucun texte fourni"}), 400
+        
+    # 2. Génération d'un nom unique pour le fichier audio
+    filename = f"{uuid.uuid4()}.wav"
+    output_path = os.path.join(AUDIO_OUTPUT_DIR, filename)
+    
+    # 3. Appel de ta fonction de génération (elle marche déjà super bien !)
+    generate_audio(text, output_path)
+    
+    # 4. LA MAGIE : On crée une URL complète (ex: https://env-intel.onrender.com/...)
+    base_url = request.host_url.rstrip('/')
+    audio_url = f"{base_url}/static/audio/{filename}"
+    
+    # 5. On renvoie l'URL complète au Frontend
+    return jsonify({"audio_url": audio_url})
 
     # Nettoyage rapide du texte pour éviter les sauts de ligne intempestifs
     clean_text = text.replace('\n', ' ').strip()
