@@ -2,7 +2,7 @@ services:
   - type: web
     name: riskagri-backend
     env: python
-    plan: starter          # ou free si tu veux tester
+    plan: free          # ou free si tu veux tester
     buildCommand: |
       pip install -r requirements.txt
       chmod +x piper/piper
