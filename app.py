@@ -1,5 +1,5 @@
 import wave
-import uuid
+from piper.voice import PiperVoice
 import subprocess
 import json, os, math, requests, datetime, re, secrets, random, time
 from flask import Flask, jsonify, request, send_from_directory
@@ -2088,6 +2088,11 @@ def incendie_analyse():
     return jsonify({"results": results})
 
 
+# ── Configuration Piper (Adaptée à ta structure) ───────────────────────────
+
+# On s'assure que _APP_DIR est bien défini. Si ce n'est pas le cas, décommente la ligne suivante :
+# _APP_DIR = os.path.dirname(os.path.abspath(__file__))
+
 # Détection dynamique du dossier de l'application
 _APP_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -2104,6 +2109,9 @@ AUDIO_OUTPUT_DIR = os.path.join(_APP_DIR, "static", "audio")
 # Création du dossier audio s'il n'existe pas (sécurité pour Render)
 os.makedirs(AUDIO_OUTPUT_DIR, exist_ok=True)
 
+# Créer le dossier audio s'il n'existe pas
+os.makedirs(AUDIO_OUTPUT_DIR, exist_ok=True)
+
 # Vérification au démarrage pour la console
 if os.path.exists(PIPER_EXE) and os.path.exists(MODEL_PATH):
     print("[TTS] Moteur Piper (Standalone) et modèle ONNX détectés avec succès.")
@@ -2111,52 +2119,19 @@ else:
     print("[TTS] ⚠️ ATTENTION : L'exécutable Piper ou le modèle est introuvable !")
 
 
-# 1. LA FONCTION QUI PILOTE PIPER (À mettre AVANT la route)
-def generate_audio(text, output_path):
-    _APP_DIR = os.path.dirname(os.path.abspath(__file__))
+# ── Route TTS ─────────────────────────────────────────────────────────────
+
+@app.route('/api/tts', methods=['POST'])
+def text_to_speech():
+    # On vérifie que les fichiers nécessaires existent avant de lancer l'opération
+    if not os.path.exists(PIPER_EXE) or not os.path.exists(MODEL_PATH):
+        return jsonify({"error": "Moteur TTS ou modèle non disponible sur le serveur"}), 500
     
-    # Choix du moteur selon l'OS
-    if os.name == 'nt':  # Windows
-        piper_path = os.path.join(_APP_DIR, "piper", "piper.exe")
-    else:  # Linux (Render)
-        piper_path = os.path.join(_APP_DIR, "piper", "piper")
-
-    model_path = os.path.join(_APP_DIR, "models", "fr_FR-siwis-low.onnx")
-
-    # Commande pour exécuter Piper
-    command = [
-        piper_path,
-        "-m", model_path,
-        "-f", output_path
-    ]
-
-    # Exécution
-    process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    process.communicate(input=text)
-
-
-# 2. LA ROUTE API (Tu l'as déjà, mais je te la remets propre en dessous)
-@app.route('/api/tts', methods=['POST', 'OPTIONS'])
-def tts():
-    if request.method == 'OPTIONS':
-        return '', 200
-        
-    data = request.get_json()
+    data = request.json
     text = data.get('text', '')
     
-    if not text:
+    if not text or not text.strip():
         return jsonify({"error": "Aucun texte fourni"}), 400
-        
-    filename = f"{uuid.uuid4()}.wav"
-    output_path = os.path.join(AUDIO_OUTPUT_DIR, filename)
-    
-    # C'est ici qu'on appelle la fonction définie juste au-dessus !
-    generate_audio(text, output_path)
-    
-    base_url = request.host_url.rstrip('/')
-    audio_url = f"{base_url}/static/audio/{filename}"
-    
-    return jsonify({"audio_url": audio_url})
 
     # Nettoyage rapide du texte pour éviter les sauts de ligne intempestifs
     clean_text = text.replace('\n', ' ').strip()
