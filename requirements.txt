@@ -6,3 +6,6 @@ sendgrid
 werkzeug
 python-dotenv
 gunicorn
+apscheduler
+numpy
+wave
