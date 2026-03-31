@@ -2096,15 +2096,15 @@ def incendie_analyse():
 # Détection dynamique du dossier de l'application
 _APP_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# Détection automatique de l'exécutable (Windows vs Linux)
-if os.name == 'nt':  # Si tu es sur ton PC (Windows)
+# Détection automatique de l'exécutable Piper
+if os.name == 'nt':
     PIPER_EXE = os.path.join(_APP_DIR, "piper", "piper.exe")
-else:  # Si tu es sur Render (Linux)
+else:
     PIPER_EXE = os.path.join(_APP_DIR, "piper", "piper")
 
-# Le reste ne change pas (les fichiers .onnx et les dossiers sont identiques)
 MODEL_PATH = os.path.join(_APP_DIR, "models", "fr_FR-siwis-low.onnx")
 AUDIO_OUTPUT_DIR = os.path.join(_APP_DIR, "static", "audio")
+os.makedirs(AUDIO_OUTPUT_DIR, exist_ok=True)
 
 # Création du dossier audio s'il n'existe pas (sécurité pour Render)
 os.makedirs(AUDIO_OUTPUT_DIR, exist_ok=True)
