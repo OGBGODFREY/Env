@@ -1,0 +1,163 @@
+name: Update Météo EPCI
+
+on:
+  schedule:
+    # ── 5 batches décalés de 5 min, tous les jours ──────────────────────────
+    # Heures UTC pour cibler ~14h20–14h40 heure de Paris (UTC+1 hiver / UTC+2 été)
+    # En hiver (UTC+1) : 13h20 UTC → 14h20 Paris
+    # En été  (UTC+2) : 12h20 UTC → 14h20 Paris
+    # GitHub cron ne gère pas DST → on choisit l'heure UTC+1 (hiver).
+    # En été, les batches arriveront à 15h20–15h40 Paris : acceptable.
+    - cron: '20 13 * * *'   # batch 0 → 14h20 Paris (hiver)
+    - cron: '25 13 * * *'   # batch 1 → 14h25 Paris
+    - cron: '30 13 * * *'   # batch 2 → 14h30 Paris
+    - cron: '35 13 * * *'   # batch 3 → 14h35 Paris
+    - cron: '40 13 * * *'   # batch 4 → 14h40 Paris
+
+  # Déclenchement manuel (workflow_dispatch) : demande l'index du batch à lancer
+  workflow_dispatch:
+    inputs:
+      batch_index:
+        description: "Batch à lancer (0 = 1er 1/5, …, 4 = dernier 1/5) — laisser vide pour tout lancer"
+        required: false
+        default: ''
+
+# Permissions pour committer et pusher
+permissions:
+  contents: write
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  # ────────────────────────────────────────────────────────────
+  # Job déclenché par le CRON : détermine automatiquement quel
+  # batch correspond à l'heure courante (minutes 20/25/30/35/40)
+  # ────────────────────────────────────────────────────────────
+  update-meteo-cron:
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Déterminer l'index du batch selon l'heure UTC
+        id: detect
+        run: |
+          MINUTE=$(date -u '+%M')
+          case $MINUTE in
+            20) echo "batch=0" >> $GITHUB_OUTPUT ;;
+            25) echo "batch=1" >> $GITHUB_OUTPUT ;;
+            30) echo "batch=2" >> $GITHUB_OUTPUT ;;
+            35) echo "batch=3" >> $GITHUB_OUTPUT ;;
+            40) echo "batch=4" >> $GITHUB_OUTPUT ;;
+            *)  echo "batch=0" >> $GITHUB_OUTPUT
+                echo "⚠️  Minute $MINUTE non prévue, on force batch 0"
+                ;;
+          esac
+
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          persist-credentials: true
+
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-meteo-${{ hashFiles('**/requirements*.txt') }}
+          restore-keys: pip-meteo-
+
+      - name: Installer les dépendances
+        run: |
+          pip install --upgrade pip
+          pip install openmeteo-requests requests-cache retry-requests numpy pandas
+
+      - name: Lancer update_meteo.py (batch ${{ steps.detect.outputs.batch }})
+        env:
+          BATCH_INDEX: ${{ steps.detect.outputs.batch }}
+        run: python update_meteo.py
+
+      - name: Commit et push si changements
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add points_epci_meteo.geojson
+          BATCH=${{ steps.detect.outputs.batch }}
+          if git diff --staged --quiet; then
+            echo "Aucun changement — pas de commit."
+          else
+            git commit -m "chore: météo EPCI batch $((BATCH+1))/5 [$(date -u '+%Y-%m-%d %H:%M UTC')]"
+            git push origin HEAD:main
+          fi
+
+  # ────────────────────────────────────────────────────────────
+  # Job déclenché MANUELLEMENT
+  #   - Si batch_index renseigné → lance uniquement ce batch
+  #   - Si vide                  → lance les 5 batches en séquence
+  # ────────────────────────────────────────────────────────────
+  update-meteo-manual:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          persist-credentials: true
+
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-meteo-${{ hashFiles('**/requirements*.txt') }}
+          restore-keys: pip-meteo-
+
+      - name: Installer les dépendances
+        run: |
+          pip install --upgrade pip
+          pip install openmeteo-requests requests-cache retry-requests numpy pandas
+
+      # ── Batch unique si batch_index fourni ──
+      - name: Lancer un batch précis
+        if: ${{ github.event.inputs.batch_index != '' }}
+        env:
+          BATCH_INDEX: ${{ github.event.inputs.batch_index }}
+        run: python update_meteo.py
+
+      # ── Tous les batches si batch_index vide ──
+      - name: Lancer TOUS les batches (0 → 4)
+        if: ${{ github.event.inputs.batch_index == '' }}
+        run: |
+          for i in 0 1 2 3 4; do
+            echo "════════════════════════════════════════"
+            echo "▶  Batch $((i+1))/5"
+            echo "════════════════════════════════════════"
+            BATCH_INDEX=$i python update_meteo.py
+            # Petite pause entre batches pour éviter de saturer l'API
+            if [ $i -lt 4 ]; then sleep 10; fi
+          done
+
+      - name: Commit et push si changements
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add points_epci_meteo.geojson
+          LABEL="${{ github.event.inputs.batch_index }}"
+          if [ -z "$LABEL" ]; then LABEL="all"; fi
+          if git diff --staged --quiet; then
+            echo "Aucun changement — pas de commit."
+          else
+            git commit -m "chore: météo EPCI batch ${LABEL} (manuel) [$(date -u '+%Y-%m-%d %H:%M UTC')]"
+            git push origin HEAD:main
+          fi
