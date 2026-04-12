@@ -8,11 +8,11 @@ on:
     # En été  (UTC+2) : 12h20 UTC → 14h20 Paris
     # GitHub cron ne gère pas DST → on choisit l'heure UTC+1 (hiver).
     # En été, les batches arriveront à 15h20–15h40 Paris : acceptable.
-    - cron: '20 13 * * *'   # batch 0 → 14h20 Paris (hiver)
-    - cron: '25 13 * * *'   # batch 1 → 14h25 Paris
-    - cron: '30 13 * * *'   # batch 2 → 14h30 Paris
-    - cron: '35 13 * * *'   # batch 3 → 14h35 Paris
-    - cron: '40 13 * * *'   # batch 4 → 14h40 Paris
+    - cron: '0 23 * * *'    # batch 0 → 00h00 Paris (hiver) / 23h00 UTC
+    - cron: '5 23 * * *'    # batch 1 → 00h05 Paris (hiver)
+    - cron: '10 23 * * *'   # batch 2 → 00h10 Paris (hiver)
+    - cron: '15 23 * * *'   # batch 3 → 00h15 Paris (hiver)
+    - cron: '20 23 * * *'   # batch 4 → 00h20 Paris (hiver)
 
   # Déclenchement manuel (workflow_dispatch) : demande l'index du batch à lancer
   workflow_dispatch:
